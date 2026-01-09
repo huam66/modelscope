@@ -18,3 +18,4 @@ Embedding 模型: BAAI/bge-small-zh-v1.5
 Web 框架: Gradio
 分块策略: RecursiveCharacterTextSplitter（保留完整句子）
 运行环境: Python 3.9+, PyTorch, CUDA（可选）
+人工智能通识教程pdf是RAG训练材料，21.pdf是微调材料
