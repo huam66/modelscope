@@ -1,0 +1,217 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+RAG 问答系统：基于技术文档（PDF）的智能问答
+功能：
+1. 从 PDF 提取文本并切分
+2. 使用 BGE-small-zh-v1.5 构建向量索引
+3. 加载 Qwen2.5-0.5B-Instruct 模型
+4. 提供 Gradio Web 界面，支持自然语言问答
+"""
+
+import os
+import torch
+import numpy as np
+import pdfplumber
+import gradio as gr
+from sentence_transformers import SentenceTransformer
+import faiss
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# 设置 Hugging Face 镜像（可选，国内加速）
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+# ================================
+# 1. PDF 文本提取与分块
+# ================================
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """提取 PDF 全部文本"""
+    text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return text
+
+def split_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list:
+    """滑动窗口切分文本"""
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        chunks.append(chunk)
+        start = end - overlap  # 重叠区域
+    return chunks
+
+# ================================
+# 2. 构建向量检索器
+# ================================
+class VectorRetriever:
+    def __init__(self, chunks: list, model_name: str = 'BAAI/bge-small-zh-v1.5'):
+        self.chunks = chunks
+        self.model = SentenceTransformer(model_name)
+        print(f"正在为 {len(chunks)} 个文本块生成嵌入向量...")
+        embeddings = self.model.encode(
+            chunks,
+            normalize_embeddings=True,
+            show_progress_bar=True
+        )
+        self.embeddings = np.array(embeddings).astype('float32')
+        self.dim = self.embeddings.shape[1]
+        self.index = faiss.IndexFlatIP(self.dim)
+        self.index.add(self.embeddings)
+        print(f"✅ 向量库构建完成，维度: {self.dim}，块数: {len(chunks)}")
+
+    def retrieve(self, query: str, top_k: int = 3) -> list:
+        """检索 top_k 个最相关文本块"""
+        query_vec = self.model.encode([query], normalize_embeddings=True).astype('float32')
+        scores, indices = self.index.search(query_vec, top_k)
+        results = [self.chunks[i] for i in indices[0]]
+        return results
+
+# ================================
+# 3. 加载 Qwen 模型
+# ================================
+def load_qwen_model(model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"):
+    """加载 Qwen 模型和分词器"""
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        trust_remote_code=True
+    )
+    return tokenizer, model
+
+# ================================
+# 4. RAG 问答函数
+# ================================
+def rag_qa_detailed(question: str, retriever: VectorRetriever, tokenizer, model, top_k: int = 4):
+    """检索 + 生成详细回答"""
+    # 检索
+    retrieved_docs = retriever.retrieve(question, top_k=top_k)
+    context = "\n".join(f"[片段{i+1}] {doc}" for i, doc in enumerate(retrieved_docs))
+
+    # 构造 prompt
+    messages = [{
+        "role": "user",
+        "content": (
+            "你是一个专业、细致、知识渊博的 AI 助手，请严格根据以下参考资料回答问题。\n"
+            "要求：\n"
+            "- 回答应尽可能详细、全面，包含关键细节；\n"
+            "- 如果涉及流程、功能或步骤，请分点说明（使用 1. 2. 3. 或 •）；\n"
+            "- 不要编造信息，所有内容必须基于参考资料；\n"
+            "- 如果参考资料中没有相关信息，请明确回答：“根据提供的资料无法回答该问题。”\n\n"
+            f"参考资料：\n{context}\n\n"
+            f"问题：{question}\n\n"
+            "请给出详细回答："
+        )
+    }]
+
+    # 编码输入
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        return_tensors="pt",
+        tokenize=True,
+        return_dict=True
+    )
+    input_ids = encoded["input_ids"].to(model.device)
+    attention_mask = encoded["attention_mask"].to(model.device)
+
+    # 生成回答
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=896,
+            do_sample=True,
+            temperature=0.6,
+            top_p=0.9,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            repetition_penalty=1.1
+        )
+
+    # 解码回答
+    response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
+    return response.strip(), retrieved_docs
+
+# ================================
+# 5. Gradio 接口函数
+# ================================
+def qa_interface(question: str, retriever, tokenizer, model):
+    if not question or not question.strip():
+        return "请输入一个问题。", ""
+
+    try:
+        answer, sources = rag_qa_detailed(question.strip(), retriever, tokenizer, model)
+        # 格式化参考片段
+        formatted_sources = []
+        for i, src in enumerate(sources, 1):
+            snippet = src[:250].strip()
+            if len(src) > 250:
+                snippet += "..."
+            formatted_sources.append(f"【参考 {i}】\n{snippet}")
+        sources_md = "\n\n".join(formatted_sources) if formatted_sources else "无参考片段。"
+        return answer, sources_md
+    except Exception as e:
+        return f"❌ 检索出错：{str(e)}", ""
+
+# ================================
+# 6. 主程序入口
+# ================================
+if __name__ == "__main__":
+    # 配置路径
+    pdf_path = "21.pdf"          # 你的 PDF 文件名
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"未找到 PDF 文件：{pdf_path}")
+
+    print("📄 提取 PDF 文本...")
+    full_text = extract_text_from_pdf(pdf_path)
+    print(f"✅ 提取文本长度：{len(full_text)} 字符")
+
+    print("✂️ 切分文本块...")
+    chunks = split_text(full_text, chunk_size=500, overlap=50)
+    print(f"✅ 切分为 {len(chunks)} 个文本块")
+
+    print("🧠 构建向量检索器...")
+    retriever = VectorRetriever(chunks)
+
+    print("🤖 加载 Qwen 模型...")
+    tokenizer, model = load_qwen_model("Qwen/Qwen2.5-0.5B-Instruct")
+
+    print("🌐 启动 Gradio 界面...")
+    with gr.Blocks(title="RAG 技术问答助手") as demo:
+        gr.Markdown("## 💬 技术文档 RAG 问答助手")
+        gr.Markdown("基于 PDF 文档的智能问答，支持操作系统、网络、并发编程等领域")
+
+        with gr.Row():
+            with gr.Column(scale=2):
+                question_input = gr.Textbox(
+                    label="❓ 请输入你的技术问题",
+                    placeholder="例如：为什么在高并发服务器中推荐使用线程池而不是为每个请求创建新线程？",
+                    lines=3
+                )
+                submit_btn = gr.Button("🔍 获取答案", variant="primary")
+                gr.Examples(
+                    examples=[
+                        "为什么在高并发服务器中推荐使用线程池而不是为每个请求创建新线程？",
+                        "epoll 和 select 的区别是什么？",
+                        "什么是 C10K 问题？如何解决？",
+                        "Redis 为什么是单线程的？"
+                    ],
+                    inputs=question_input
+                )
+            with gr.Column(scale=3):
+                answer_output = gr.Textbox(label="💡 详细回答", interactive=False, lines=8)
+                sources_output = gr.Markdown(label="📄 参考片段（来自技术文档）")
+
+        submit_btn.click(
+            fn=lambda q: qa_interface(q, retriever, tokenizer, model),
+            inputs=question_input,
+            outputs=[answer_output, sources_output]
+        )
+
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
